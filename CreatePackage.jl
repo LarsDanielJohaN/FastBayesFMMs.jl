@@ -9,6 +9,7 @@ using PkgTemplates
 t = Template(;
            user="LarsDanielJohaN",
            authors=["Lars Daniel Johansson Nino"],
+           dir = "C:\\Users\\End User\\Desktop\\ITAM\\Tesis\\FastBayesFMMs\\", 
            plugins=[
                License(name="MIT"),
                Git(),

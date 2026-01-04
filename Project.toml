@@ -1,0 +1,13 @@
+name = "FastBayesFMMs"
+uuid = "036f2824-ec94-44b2-b081-d8471f2a7de3"
+authors = ["Lars Daniel Johansson Nino"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.10.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
