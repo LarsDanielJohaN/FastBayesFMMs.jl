@@ -1,5 +1,5 @@
 module FastBayesFMMs
-
-# Write your package code here.
+    include("MCMC.jl")
+    include("VizUtils")
 
 end

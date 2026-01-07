@@ -1,0 +1,238 @@
+using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall,BenchmarkTools, BlockDiagonals
+
+function sim_flfosr(N, Mi, L, Tn, K)
+    println("Simulating data using R's FLFOSR library...")
+    R"library(FLFOSR)"
+    R"""
+    sim_data <- sim_lfosr_data($N, $Mi, $L, $Tn, $K)
+    """
+    M_rep = rcopy(R"as.vector(   table(sim_data$z)            )")
+    z = rcopy(R"sim_data$z")
+    Y = rcopy(R"sim_data$Y")
+    X = rcopy(R"sim_data$X[sim_data$z,  ]")
+    alpha_true = rcopy(R"sim_data$alphaf")
+    return Dict( "Y"=>Y, "M_rep"=>M_rep, "z"=>z, "X"=>X, "alpha_true"=>alpha_true)
+end
+
+
+function rowsum(A::Matrix{Float64}, idx::Vector{Int64}, id::Vector{Int64})
+    r,c = size(A)
+    T = Matrix{Float64}(undef, length(id), c)
+    for i in id
+        T[i, :] = sum( A[idx .== i, :],  dims = 1  )
+    end
+    return T 
+end
+
+
+function rowsum(A::Vector{Float64}, idx::Vector{Int64}, id::Vector{Int64})
+
+    T = zeros(Float64, length(id))
+    counts = Dict{Int,Float64}()
+    
+    for (val, i) in zip(A, idx)
+        counts[i] = get(counts, i, 0.0) + val
+    end
+    
+    for i in id
+        T[i] = get(counts, i, 0.0)
+    end
+    
+    return T
+    #T = Vector{Float64}(undef, length(id))
+    #for i in id
+    #    T[i] = sum( A[idx .== i] )
+    #end
+    #return T 
+end
+#=
+sample_MVN_canonical. Obtains sample from MVN with mean inv(Q)b, and precision matrix Q. 
+This is performed using the procedure described on Algorithm 2.5 from Rue H. and  Held L.'s 
+Gaussian Markov Random Fields book. 
+=#
+function sample_MVN_canonical(;Q::Matrix{Float64}, b::Vector{Float64} ) #, L::Matrix{Float64})
+    x = similar(b)
+    y = similar(b)
+    L = cholesky( Symmetric(Q) ).L
+    ldiv!(y, L, b)
+    ldiv!(x, L',y)
+    ldiv!(y, L',randn(size(Q)[1]) )
+
+    return x .+ y
+end
+
+function get_Z_mat(M_rep)
+    M = sum(M_rep)
+    N = length(M_rep)
+    Z = zeros(M, N) #Creates M x N zeros matrix where M = M1 + M2 + ... + MN
+    start_idx = 1
+    for n in 1:N
+        len = M_rep[n]
+        Z[ start_idx:(start_idx + len -1), n] .= 1 #Sets the corresponding block diagonal. 
+        start_idx += len
+    end
+    return Z
+
+end
+
+
+#=
+Y: Matrix{Float64} of observations  of dimension T x M with M = M1 + M2 + ... + MN
+X: Matrix{Float64} design matrix of dimension M x L+1 with M = M1 + M2 + ... + MN
+M_rep: Vector{Int64} of size N whose ith entry corresponds to Mi, e.g. M_rep[i] = Mi
+K: Int64, number of basis functions. 
+S: Int64, number of MCMC iterations. 
+center_base: Bool, boolean value that indicates whether reparametrized base should consider a centered design matrix (for functions). 
+tol_sm: Float64, Zero tolernce for sm. e.g. in factorization all values lower than tol_sm are considered to be zero. 
+
+Notes: 
+-It is assumed that the order in Y's columns goes in accordance to the entries in M_rep. This in the sense
+that, knowing that M_rep[1] = M1, then Y[:, 1:M1] are the observations of the 1st subject, Y[:, M1+1: M1+M2] correspond to 
+the obsevations of subject 2, etc. 
+
+-It is assumed that X's rows are ordered in accordance to the columns of Y. That is, if 
+Y[:,l] corresponds to the j-th visit of the i-th subject, then X[l,:] has its corresponding covariates. 
+
+-For the basis re-paremetrization, we replicate the sm(.) function from R's spikeSlabGAM library. Specifically, we 
+replicate the function with the "ortho" decomposition option, spline.degree = 3, diff.ord = 2, centerx = x,
+and rankZ = 0.999. 
+=#
+
+function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
+    #Makes sure that appropiate inputs are recieved. 
+    T,M_Y = size(Y)
+    M_X, L_p_one = size(X)
+    M_M_rep = sum(M_rep)
+    @assert M_Y == M_X "Fatal error on flfosr!! Y should be of dimensions (T x M) and X of (M x L+1) but the M's dont coincide. "
+    @assert M_M_rep == M_X "Fatal error on flfosr!! X should be of dimensions (M x L+1) and the entries of M_rep (M1 + M2 + ... + MN) should sum to M. They dont. "
+    @assert L_p_one <= length(M_rep) "Fatal error on flfosr!! For this time, we are only allowing for L < N."
+    mis_vals = sum(isnan.(Y)) #Counts the number of missing registrations on Y. 
+ 
+
+    if mis_vals > 0 #If there are any missing values. 
+        println("A total of $mis_vals missing values found!!\nFLFOSR will procede with intermediate imputations.\nBe aware that this increases computational cost and confidence bands!\nMight be worth to explore missingness")
+        Y_user = Y #Copies the Y matrix provided by the user. 
+        NaN_vals = isnan.(Y_user) #Makes matrix whose value equals 1 if its corresponding value in Y was a NaN and 0 e.o.c. 
+        Y_user[isnan.(Y_user)].= 0 #Sets missing values to 0, this will allow to replace them with their imputations. 
+        Y = Y_user #Falta ponerle una cosa de copy. 
+        do_imputation = true
+    else #If not, follow things as usual. 
+        do_imputation = false
+    end
+
+
+    Tn, M_Y = size(Y) #Obtains number of evaluation points with Tn and total number of functions M_Y
+    N = length(M_rep) #Gets total number of subjects.
+    tau = range(0, 1, length = Tn) |> collect  #Obtains the observation points.  
+
+    id = 1:N |> collect
+    idx = inverse_rle( id, M_rep )
+    R"library(spikeSlabGAM) "
+    R"""
+        B <- cbind(1/sqrt($Tn), poly($tau, 1), sm($tau, K = $K, rankZ = .99999999,  spline.degree = 3, diff.ord = 2, centerBase = T))
+        B <- B/sqrt(sum(diag(crossprod(B))))
+        Dk <- diag(crossprod(B))
+        Bk <- B%*%diag(1/sqrt(Dk))
+         """
+
+    B = rcopy(Matrix{Float64}, R"B"   )
+    B_proj = rcopy(Matrix{Float64}, R"Bk")'
+    B = B_proj'
+
+     
+    Y_proj = B_proj*Y #Obtains projected data, now an K x M matrix. 
+    Z = get_Z_mat(M_rep)
+    ZZt= BlockDiagonal([ones(M_rep[n], M_rep[n]) for n in 1:N])
+    Alpha = zeros(K, L+1, S +1 ) #Creates K x L+1 x S tensor, each slice K x L+1 x s for s = 1,2,..., S represents the iter's sample of fixed effect coeffients. 
+    Gamma = zeros(K, N, S+1) #Creates K x N x S tensor, each slice K x N x s represents s'ths values for the subject specific effects. 
+    Omega = zeros(K, M_Y, S+1) #Creates a K x M x S tensor, each slice K x M_Y x s represents the s´ths vales for the specific specific coefficients. 
+
+    Gamma[:, :, 1] =  ((rowsum( Matrix( Y'),   idx,    1:N |>collect    ) ./M_rep )*B)'
+    Omega[:, :, 1] =  B'*(Y - B*Gamma[:, idx, 1])
+    
+    Sig_Eps = zeros(S+1) #Creates a length S vector to store the realizations for the noise variance. 
+    Sig_Eps[1] = 0.1
+    Sig_Alpha = zeros(L+1, S+1) #Creates an L x S matrix to store the realizations of the fixed effect coefficient variances. 
+    Sig_Alpha[:, 1] =2.0 * ones(L+1)
+    Sig_Gamma = zeros(S+1) #Creates a length S vector to store the realization for the subject efffect coefficient variances. 
+    Sig_Gamma[1] = 1.0
+    Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
+    Sig_Omega[:, 1] = 0.5 .* ones(N)
+
+    low_idx_M_rep = zeros(N)
+    upp_idx_M_rep = zeros(N)
+
+    low_idx_M_rep[1] = 1
+    upp_idx_M_rep[1] = M_rep[1]
+    su = 1 
+
+    for n in 2:N
+        low_idx_M_rep[n] =  su + 1 
+        upp_idx_M_rep[n] = su + M_rep[n]
+        su+= M_rep[n]
+    end
+    low_idx_M_rep = convert(Array{Int64}, low_idx_M_rep)
+    upp_idx_M_rep = convert(Array{Int64}, upp_idx_M_rep)
+    alp_sig_omega = a_omeg .+ (M_rep.*(K/2) )
+
+
+    ##---------------------------------------------------------------------------------------------------------------------------------
+    #Reserve memory space or calculate terms which will be used repeatedly during the MCMC scheme (i.e. to reduce allocation time and calculation time per iteration)
+
+    ell_alpha_k = zeros(L+1, M_Y) #Creates fixed memory for storing the terms dkX'(Vk - Wk).
+    Q_inv_gamma_k = zeros(N) #Creates fixed memory for storing the terms dk Z'Vk(yk - Xalphak).
+    Q_inv_omega_k = zeros(M_Y) #Creates fixed memory for storing terms diag({ dk/sigma_eps^2 + 1/sigma_omegai^2  })
+    Vk = zeros(M_Y, M_Y)
+    lam_sig_omega = zeros(N)
+    su = 1
+    ##---------------------------------------------------------------------------------------------------------------------------------
+
+    Alphaf = zeros(Tn, L+1, S - S_burn) #Creates a Tn x L+1 x S- S_burn tensor to store Alpha realizations in their functional form. 
+    @views begin #Tells julia that, when accessing an array (e.g. A[i,j,z]), a temporal array should not be generated. It should view/modify the elements of A[i,j,k] directly. 
+        for s in 2:(S+1) #Do MCMC iterations. 
+            if mod(s, 200) == 0 
+                println("On iteration $(s) from $(S)")
+            end
+
+
+            if do_imputation #Impute data using the parameters from the previous iteration. 
+                Y = Y_user + (B*( Alpha[:, :, s-1]*X' + Omega[:, :, s-1] + Gamma[:,idx, s-1])).*NaN_vals  #Imputes missing values and adds observed ones. 
+                Y_proj  = B_proj*Y #Makes projection step. 
+            end 
+
+            Threads.@threads for k in 1:K #Sample coefficients for each individual function in parallel. 
+
+                ell_alpha_k = X' * ( Diagonal( inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep) ) -  BlockDiagonal(  [  fill(   (  Sig_Gamma[s-1]  )/((Sig_Omega[n, s-1] + Sig_Eps[s-1] + Sig_Gamma[s-1]*M_rep[n])*(Sig_Omega[n, s-1] + Sig_Eps[s-1])  )    , (M_rep[n], M_rep[n]))  for n in 1:N ] ))
+                Alpha[k, :, s] =  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) 
+
+                Q_inv_gamma_k = 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
+                Gamma[k, :, s] =   rand(MvNormal( Sig_Gamma[s-1].* Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
+
+                Q_inv_omega_k = inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
+                Omega[k , :, s] = rand(MvNormal(Q_inv_omega_k .* (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
+
+
+            end 
+
+            #=
+            Note that Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s] constitutes the residuals of estimiating Y with the current values for the coefficients. 
+            therefore, taking the norm of the previous consitutues the sum squared residuals. 
+            =#
+            Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2, 1/( sum(    ((Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s])).^2 ) ./ 2 )   )), 1)[1] #Obtain new realization for the observation error variance. 
+            Sig_Alpha[:, s] = 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
+            Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
+            Sig_Omega[:, s] = 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
+
+            ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        end 
+    end
+    Threads.@threads for s in 1:(S - S_burn)  
+        Alphaf[: ,:, s] = B*Alpha[: ,:, s+S_burn-1]        
+    end
+
+    return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end] )
+
+end 
+
+
+export flfosr, sim_slfosr
