@@ -1,4 +1,4 @@
-using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall,BenchmarkTools, BlockDiagonals
+using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall, BlockDiagonals
 
 function sim_flfosr(N, Mi, L, Tn, K)
     println("Simulating data using R's FLFOSR library...")
@@ -82,8 +82,6 @@ X: Matrix{Float64} design matrix of dimension M x L+1 with M = M1 + M2 + ... + M
 M_rep: Vector{Int64} of size N whose ith entry corresponds to Mi, e.g. M_rep[i] = Mi
 K: Int64, number of basis functions. 
 S: Int64, number of MCMC iterations. 
-center_base: Bool, boolean value that indicates whether reparametrized base should consider a centered design matrix (for functions). 
-tol_sm: Float64, Zero tolernce for sm. e.g. in factorization all values lower than tol_sm are considered to be zero. 
 
 Notes: 
 -It is assumed that the order in Y's columns goes in accordance to the entries in M_rep. This in the sense
@@ -93,19 +91,21 @@ the obsevations of subject 2, etc.
 -It is assumed that X's rows are ordered in accordance to the columns of Y. That is, if 
 Y[:,l] corresponds to the j-th visit of the i-th subject, then X[l,:] has its corresponding covariates. 
 
--For the basis re-paremetrization, we replicate the sm(.) function from R's spikeSlabGAM library. Specifically, we 
-replicate the function with the "ortho" decomposition option, spline.degree = 3, diff.ord = 2, centerx = x,
-and rankZ = 0.999. 
 =#
 
 function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
     #Makes sure that appropiate inputs are recieved. 
     T,M_Y = size(Y)
     M_X, L_p_one = size(X)
+    L = L_p_one - 1
     M_M_rep = sum(M_rep)
     @assert M_Y == M_X "Fatal error on flfosr!! Y should be of dimensions (T x M) and X of (M x L+1) but the M's dont coincide. "
     @assert M_M_rep == M_X "Fatal error on flfosr!! X should be of dimensions (M x L+1) and the entries of M_rep (M1 + M2 + ... + MN) should sum to M. They dont. "
-    @assert L_p_one <= length(M_rep) "Fatal error on flfosr!! For this time, we are only allowing for L < N."
+    #@assert L_p_one <= length(M_rep) "Fatal error on flfosr!! For this time, we are only allowing for L < N."
+    @assert L_p_one <= M_Y "Fatal error on flfosr!! For this time, we are only allowing for L < N."
+    @assert K <= 40 "Fatal error on flfosr!! Were only allowing K<=40 for this time."
+
+    @assert S > S_burn "Fatal error on flfosr!! S <= S_burn, i.e. the number of iterations is lower or equal to the burn in. "
     mis_vals = sum(isnan.(Y)) #Counts the number of missing registrations on Y. 
  
 
@@ -141,6 +141,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
      
     Y_proj = B_proj*Y #Obtains projected data, now an K x M matrix. 
+
     Z = get_Z_mat(M_rep)
     ZZt= BlockDiagonal([ones(M_rep[n], M_rep[n]) for n in 1:N])
     Alpha = zeros(K, L+1, S +1 ) #Creates K x L+1 x S tensor, each slice K x L+1 x s for s = 1,2,..., S represents the iter's sample of fixed effect coeffients. 
@@ -206,19 +207,20 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
                 Alpha[k, :, s] =  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) 
 
                 Q_inv_gamma_k = 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
-                Gamma[k, :, s] =   rand(MvNormal( Sig_Gamma[s-1].* Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
+                Gamma[k, :, s] =   rand(MvNormal(  Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
 
                 Q_inv_omega_k = inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
                 Omega[k , :, s] = rand(MvNormal(Q_inv_omega_k .* (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
-
-
             end 
-
             #=
             Note that Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s] constitutes the residuals of estimiating Y with the current values for the coefficients. 
             therefore, taking the norm of the previous consitutues the sum squared residuals. 
             =#
+
+
+        
             Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2, 1/( sum(    ((Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s])).^2 ) ./ 2 )   )), 1)[1] #Obtain new realization for the observation error variance. 
+          
             Sig_Alpha[:, s] = 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
             Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
             Sig_Omega[:, s] = 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
