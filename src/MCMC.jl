@@ -199,7 +199,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
             if do_imputation #Impute data using the parameters from the previous iteration. 
                 #Y = Y_user + (B*( Alpha[:, :, s-1]*X' + Omega[:, :, s-1] + Gamma[:,idx, s-1])).*NaN_vals  #Imputes missing values and adds observed ones. 
-                Y = Y_user + (Y_hat[s-1, :, :] + reshape(rand(Distributions.Normal(0, Sig_Eps[s-1]), Tn*M_y ), (Tn, M_y))  ).*NaN_vals  #Imputes missing values and adds observed ones. 
+                Y = Y_user + (Y_hat[s-1, :, :] + reshape(rand(Distributions.Normal(0, Sig_Eps[s-1]), Tn*M_Y ), (Tn, M_Y))  ).*NaN_vals  #Imputes missing values and adds observed ones. 
 
                 Y_proj  = B_proj*Y #Makes projection step. 
             end 
