@@ -159,6 +159,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Sig_Gamma[1] = 1.0
     Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
     Sig_Omega[:, 1] = 0.5 .* ones(N)
+    Y_hat = zeros(S+1, Tn, M_Y)
 
     low_idx_M_rep = zeros(N)
     upp_idx_M_rep = zeros(N)
@@ -197,7 +198,9 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
 
             if do_imputation #Impute data using the parameters from the previous iteration. 
-                Y = Y_user + (B*( Alpha[:, :, s-1]*X' + Omega[:, :, s-1] + Gamma[:,idx, s-1])).*NaN_vals  #Imputes missing values and adds observed ones. 
+                #Y = Y_user + (B*( Alpha[:, :, s-1]*X' + Omega[:, :, s-1] + Gamma[:,idx, s-1])).*NaN_vals  #Imputes missing values and adds observed ones. 
+                Y = Y_user + (Y_hat[s-1, :, :] + reshape(rand(Distributions.Normal(0, Sig_Eps[s-1]), Tn*M_y ), (Tn, M_y))  ).*NaN_vals  #Imputes missing values and adds observed ones. 
+
                 Y_proj  = B_proj*Y #Makes projection step. 
             end 
 
@@ -225,6 +228,8 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
             Sig_Omega[:, s] = 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
 
+            Y_hat[s, :, : ] = B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates. 
+
             ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         end 
     end
@@ -232,7 +237,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
         Alphaf[: ,:, s] = B*Alpha[: ,:, s+S_burn-1]        
     end
 
-    return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end] )
+    return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end], "Y_hat" =>Y_hat[S_burn:end, :, :] )
 
 end 
 
