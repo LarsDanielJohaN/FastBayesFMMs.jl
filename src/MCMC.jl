@@ -1,4 +1,4 @@
-using LinearAlgebra, Distributions ,  Base.Threads, StatsBase, RCall, BlockDiagonals
+using LinearAlgebra, Distributions , Random, Base.Threads, StatsBase, RCall, BlockDiagonals
 
 function sim_flfosr(N, Mi, L, Tn, K)
     println("Simulating data using R's FLFOSR library...")
@@ -93,7 +93,7 @@ Y[:,l] corresponds to the j-th visit of the i-th subject, then X[l,:] has its co
 
 =#
 
-function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
+function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, ssr_protection = false, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
     #Makes sure that appropiate inputs are recieved. 
     T,M_Y = size(Y)
     M_X, L_p_one = size(X)
@@ -107,6 +107,10 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
     @assert S > S_burn "Fatal error on flfosr!! S <= S_burn, i.e. the number of iterations is lower or equal to the burn in. "
     mis_vals = sum(isnan.(Y)) #Counts the number of missing registrations on Y. 
+
+    if ssr_protection
+        println("Warning! ssr_protection = true changes the prior distribution for sigma_varepsilon^2 to an IG(a_alph, a_alph) model so that\n the posterior model will always have (numerically) well defined posterior parameters.\n If an error like theta = 0 occurs, usually ssr values are very large, it is recommended to change K.")
+    end
  
 
     if mis_vals > 0 #If there are any missing values. 
@@ -160,6 +164,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
     Sig_Omega[:, 1] = 0.5 .* ones(N)
     Y_hat = zeros(S+1, Tn, M_Y)
+    Y_hat[1, :, :] .= mean(Y)
 
     low_idx_M_rep = zeros(N)
     upp_idx_M_rep = zeros(N)
@@ -186,6 +191,8 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Q_inv_omega_k = zeros(M_Y) #Creates fixed memory for storing terms diag({ dk/sigma_eps^2 + 1/sigma_omegai^2  })
     Vk = zeros(M_Y, M_Y)
     lam_sig_omega = zeros(N)
+    Eps_buffer = Matrix{Float64}(undef, Tn, M_Y)
+
     su = 1
     ##---------------------------------------------------------------------------------------------------------------------------------
 
@@ -198,43 +205,41 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
 
             if do_imputation #Impute data using the parameters from the previous iteration. 
-                #Y = Y_user + (B*( Alpha[:, :, s-1]*X' + Omega[:, :, s-1] + Gamma[:,idx, s-1])).*NaN_vals  #Imputes missing values and adds observed ones. 
-                Y = Y_user + (Y_hat[s-1, :, :] + reshape(rand(Distributions.Normal(0, Sig_Eps[s-1]), Tn*M_Y ), (Tn, M_Y))  ).*NaN_vals  #Imputes missing values and adds observed ones. 
-
-                Y_proj  = B_proj*Y #Makes projection step. 
+                Random.rand!(Distributions.Normal(0, Sig_Eps[s-1]), Eps_buffer)
+                Y .= Y_user + (Y_hat[s-1, :, :] + Eps_buffer ).*NaN_vals  #Imputes missing values and adds observed ones. 
+                Y_proj  .= B_proj*Y #Makes projection step. 
             end 
+
+            ell_alpha_k .= X' * ( Diagonal( inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep) ) -  BlockDiagonal(  [  fill(   (  Sig_Gamma[s-1]  )/((Sig_Omega[n, s-1] + Sig_Eps[s-1] + Sig_Gamma[s-1]*M_rep[n])*(Sig_Omega[n, s-1] + Sig_Eps[s-1])  )    , (M_rep[n], M_rep[n]))  for n in 1:N ] ))
+            Q_inv_gamma_k .= 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
+            Q_inv_omega_k .= inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
+
 
             Threads.@threads for k in 1:K #Sample coefficients for each individual function in parallel. 
 
-                ell_alpha_k = X' * ( Diagonal( inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep) ) -  BlockDiagonal(  [  fill(   (  Sig_Gamma[s-1]  )/((Sig_Omega[n, s-1] + Sig_Eps[s-1] + Sig_Gamma[s-1]*M_rep[n])*(Sig_Omega[n, s-1] + Sig_Eps[s-1])  )    , (M_rep[n], M_rep[n]))  for n in 1:N ] ))
-                Alpha[k, :, s] =  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) 
-
-                Q_inv_gamma_k = 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
-                Gamma[k, :, s] =   rand(MvNormal(  Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
-
-                Q_inv_omega_k = inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
-                Omega[k , :, s] = rand(MvNormal(Q_inv_omega_k .* (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
+                Alpha[k, :, s] .=  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) 
+                Gamma[k, :, s] .=   rand(MvNormal(  Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
+                Omega[k , :, s] .= rand(MvNormal(Q_inv_omega_k .* (  (1/Sig_Eps[s-1]).*(Y_proj[k, :] - X* Alpha[k, :, s] - Gamma[k, idx, s] )   ),  Diagonal(Q_inv_omega_k)    ), 1)
             end 
             #=
             Note that Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s] constitutes the residuals of estimiating Y with the current values for the coefficients. 
             therefore, taking the norm of the previous consitutues the sum squared residuals. 
             =#
-
+            Y_hat[s, :, : ] .= B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates. 
 
         
-            Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2, 1/( sum(    ((Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s])).^2 ) ./ 2 )   )), 1)[1] #Obtain new realization for the observation error variance. 
+            Sig_Eps[s] = 1/rand(Distributions.Gamma(a_alph*Int64(ssr_protection) + Tn*M_Y/2, a_alph*Int64(ssr_protection) + exp(  -log(sum(    ((Y - Y_hat[s, :, : ]).^2 )  )/2   ) )      ), 1)[1] #Obtain new realization for the observation error variance. 
           
-            Sig_Alpha[:, s] = 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
+            Sig_Alpha[:, s] .= 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
             Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
-            Sig_Omega[:, s] = 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
+            Sig_Omega[:, s] .= 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
 
-            Y_hat[s, :, : ] = B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates. 
 
             ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         end 
     end
     Threads.@threads for s in 1:(S - S_burn)  
-        Alphaf[: ,:, s] = B*Alpha[: ,:, s+S_burn-1]        
+        Alphaf[: ,:, s] .= B*Alpha[: ,:, s+S_burn-1]        
     end
 
     return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end], "Y_hat" =>Y_hat[S_burn:end, :, :] )
