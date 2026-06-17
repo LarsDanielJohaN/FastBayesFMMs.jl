@@ -93,7 +93,7 @@ Y[:,l] corresponds to the j-th visit of the i-th subject, then X[l,:] has its co
 
 =#
 
-function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, ssr_protection = false, K::Int64 = 10, S::Int64=2000 , S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
+function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64},  K::Int64 = 10, S::Int64=2000 , informed_first_guess = true, S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
     #Makes sure that appropiate inputs are recieved. 
     T,M_Y = size(Y)
     M_X, L_p_one = size(X)
@@ -103,22 +103,22 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     @assert M_M_rep == M_X "Fatal error on flfosr!! X should be of dimensions (M x L+1) and the entries of M_rep (M1 + M2 + ... + MN) should sum to M. They dont. "
     #@assert L_p_one <= length(M_rep) "Fatal error on flfosr!! For this time, we are only allowing for L < N."
     @assert L_p_one <= M_Y "Fatal error on flfosr!! For this time, we are only allowing for L < N."
-    @assert K <= 40 "Fatal error on flfosr!! Were only allowing K<=40 for this time."
+    #@assert K <= 40 "Fatal error on flfosr!! Were only allowing K<=40 for this time."
 
     @assert S > S_burn "Fatal error on flfosr!! S <= S_burn, i.e. the number of iterations is lower or equal to the burn in. "
     mis_vals = sum(isnan.(Y)) #Counts the number of missing registrations on Y. 
 
-    if ssr_protection
-        println("Warning! ssr_protection = true changes the prior distribution for sigma_varepsilon^2 to an IG(a_alph, a_alph) model so that\n the posterior model will always have (numerically) well defined posterior parameters.\n If an error like theta = 0 occurs, usually ssr values are very large, it is recommended to change K.")
-    end
+    #if ssr_protection
+    #    println("Warning! ssr_protection = true changes the prior distribution for sigma_varepsilon^2 to an IG(a_alph, a_alph) model so that\n the posterior model will always have (numerically) well defined posterior parameters.\n If an error like theta = 0 occurs, usually ssr values are very large, it is recommended to change K.")
+    #end
  
 
     if mis_vals > 0 #If there are any missing values. 
         println("A total of $mis_vals missing values found!!\nFLFOSR will procede with intermediate imputations.\nBe aware that this increases computational cost and confidence bands!\nMight be worth to explore missingness")
-        Y_user = Y #Copies the Y matrix provided by the user. 
+        Y_user = copy(Y) #Copies the Y matrix provided by the user. 
         NaN_vals = isnan.(Y_user) #Makes matrix whose value equals 1 if its corresponding value in Y was a NaN and 0 e.o.c. 
         Y_user[isnan.(Y_user)].= 0 #Sets missing values to 0, this will allow to replace them with their imputations. 
-        Y = Y_user #Falta ponerle una cosa de copy. 
+        Y = copy(Y_user) #Falta ponerle una cosa de copy. 
         do_imputation = true
     else #If not, follow things as usual. 
         do_imputation = false
@@ -131,19 +131,31 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
     id = 1:N |> collect
     idx = inverse_rle( id, M_rep )
-    R"library(spikeSlabGAM) "
-    R"""
-        B <- cbind(1/sqrt($Tn), poly($tau, 1), sm($tau, K = $K, rankZ = .99999999,  spline.degree = 3, diff.ord = 2, centerBase = T))
-        B <- B/sqrt(sum(diag(crossprod(B))))
-        Dk <- diag(crossprod(B))
-        Bk <- B%*%diag(1/sqrt(Dk))
-         """
 
+    if K<= 40 
+
+        R"library(spikeSlabGAM) "
+        R"""
+            B <- cbind(1/sqrt($Tn), poly($tau, 1), sm($tau, K = $K, rankZ = .99999999,  spline.degree = 3, diff.ord = 2, centerBase = T))
+            B <- B/sqrt(sum(diag(crossprod(B))))
+            Dk <- diag(crossprod(B))
+            Bk <- B%*%diag(1/sqrt(Dk))
+            """
+    else 
+        Kp = K+2
+        R"library(spikeSlabGAM) "
+        R"""
+            B <- cbind(1/sqrt($Tn), poly($tau, 1), sm($tau, K = $Kp, rankZ = .99999999,  spline.degree = 3, diff.ord = 2, centerBase = T))
+            B <- B/sqrt(sum(diag(crossprod(B))))
+            Dk <- diag(crossprod(B))
+            Bk <- B%*%diag(1/sqrt(Dk))
+            """
+
+    end
+    
     B = rcopy(Matrix{Float64}, R"B"   )
     B_proj = rcopy(Matrix{Float64}, R"Bk")'
-    B = B_proj'
-
-     
+    B = B_proj'  
     Y_proj = B_proj*Y #Obtains projected data, now an K x M matrix. 
 
     Z = get_Z_mat(M_rep)
@@ -152,19 +164,32 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Gamma = zeros(K, N, S+1) #Creates K x N x S tensor, each slice K x N x s represents s'ths values for the subject specific effects. 
     Omega = zeros(K, M_Y, S+1) #Creates a K x M x S tensor, each slice K x M_Y x s represents the s´ths vales for the specific specific coefficients. 
 
-    Gamma[:, :, 1] =  ((rowsum( Matrix( Y'),   idx,    1:N |>collect    ) ./M_rep )*B)'
-    Omega[:, :, 1] =  B'*(Y - B*Gamma[:, idx, 1])
     
     Sig_Eps = zeros(S+1) #Creates a length S vector to store the realizations for the noise variance. 
-    Sig_Eps[1] = 0.1
+    Sig_Eps[1] = 10.0
     Sig_Alpha = zeros(L+1, S+1) #Creates an L x S matrix to store the realizations of the fixed effect coefficient variances. 
     Sig_Alpha[:, 1] =2.0 * ones(L+1)
     Sig_Gamma = zeros(S+1) #Creates a length S vector to store the realization for the subject efffect coefficient variances. 
-    Sig_Gamma[1] = 1.0
+    Sig_Gamma[1] = 10.0
     Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
     Sig_Omega[:, 1] = 0.5 .* ones(N)
     Y_hat = zeros(S+1, Tn, M_Y)
-    Y_hat[1, :, :] .= mean(Y)
+
+
+
+    if informed_first_guess ==  true
+        println("Will make informed first guess for  values.\n Be aware that this may increase computation time. ")
+        for k in 1:K 
+            A= pinv(X'*X)
+            Alpha[k, :, 1] = A*X'Y_proj[k, :]#Get OLS estimate for first trial. 
+        end
+        Gamma[:, :, 1] =  ((rowsum( Matrix( Y'),   idx,    1:N |>collect    ) ./M_rep )*B)'
+        Omega[:, :, 1] =  B'*(Y - B*Gamma[:, idx, 1])
+        Y_hat[1, :, :]  =  B*( Alpha[:, :, 1]*X' + Omega[:, :, 1] + Gamma[:,idx, 1])
+        Sig_Eps[1] = var( Y -Y_hat[1, :, :]  ) 
+    end
+
+    
 
     low_idx_M_rep = zeros(N)
     upp_idx_M_rep = zeros(N)
@@ -205,8 +230,8 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
 
             if do_imputation #Impute data using the parameters from the previous iteration. 
-                Random.rand!(Distributions.Normal(0, Sig_Eps[s-1]), Eps_buffer)
-                Y .= Y_user + (Y_hat[s-1, :, :] + Eps_buffer ).*NaN_vals  #Imputes missing values and adds observed ones. 
+                Random.rand!(Distributions.Normal(0, sqrt(Sig_Eps[s-1])), Eps_buffer)
+                Y .= Y_user + (Y_hat[s-1, :, : ]+ Eps_buffer ).*NaN_vals  #Imputes missing values and adds observed ones. 
                 Y_proj  .= B_proj*Y #Makes projection step. 
             end 
 
@@ -214,8 +239,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             Q_inv_gamma_k .= 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
             Q_inv_omega_k .= inverse_rle(   1 ./ ( (1/Sig_Eps[s-1]) .+ (1 ./ Sig_Omega[:, s-1]) ), M_rep)
 
-
-            Threads.@threads for k in 1:K #Sample coefficients for each individual function in parallel. 
+            for k in 1:K #Sample coefficients for each individual function in parallel. 
 
                 Alpha[k, :, s] .=  sample_MVN_canonical( Q = Diagonal(1 ./ Sig_Alpha[:, s-1]) + ell_alpha_k*X ,  b = ell_alpha_k*Y_proj[k, :] ) 
                 Gamma[k, :, s] .=   rand(MvNormal(  Q_inv_gamma_k .* rowsum(  inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep)  .* (Y_proj[k, :] - X*Alpha[k, :, s]), idx, id ), Diagonal(Q_inv_gamma_k)    )    ,1)
@@ -225,14 +249,12 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             Note that Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s] constitutes the residuals of estimiating Y with the current values for the coefficients. 
             therefore, taking the norm of the previous consitutues the sum squared residuals. 
             =#
-            Y_hat[s, :, : ] .= B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates. 
-
-        
-            Sig_Eps[s] = 1/rand(Distributions.Gamma(a_alph*Int64(ssr_protection) + Tn*M_Y/2, a_alph*Int64(ssr_protection) + exp(  -log(sum(    ((Y - Y_hat[s, :, : ]).^2 )  )/2   ) )      ), 1)[1] #Obtain new realization for the observation error variance. 
-          
+            Y_hat[s, :, : ] .= B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates.         
+            Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2 , (2/ sum(((Y - Y_hat[s, :, : ]).^2 ) ) )      ), 1)[1] #Obtain new realization for the observation error variance. 
             Sig_Alpha[:, s] .= 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
-            Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))    ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
-            Sig_Omega[:, s] .= 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega,  1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N] )      )   
+            Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))   ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
+            Sig_Omega[:, s] .= 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega, 1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N]  )      )   
+
 
 
             ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
