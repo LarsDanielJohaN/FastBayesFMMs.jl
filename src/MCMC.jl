@@ -234,6 +234,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
                 Y .= Y_user + (Y_hat[s-1, :, : ]+ Eps_buffer ).*NaN_vals  #Imputes missing values and adds observed ones. 
                 Y_proj  .= B_proj*Y #Makes projection step. 
             end 
+            
 
             ell_alpha_k .= X' * ( Diagonal( inverse_rle(1 ./ (Sig_Eps[s-1] .+ Sig_Omega[:, s-1]), M_rep) ) -  BlockDiagonal(  [  fill(   (  Sig_Gamma[s-1]  )/((Sig_Omega[n, s-1] + Sig_Eps[s-1] + Sig_Gamma[s-1]*M_rep[n])*(Sig_Omega[n, s-1] + Sig_Eps[s-1])  )    , (M_rep[n], M_rep[n]))  for n in 1:N ] ))
             Q_inv_gamma_k .= 1 ./ ((1/Sig_Gamma[s-1]) .+ M_rep .* (   1 ./(    Sig_Eps[s-1] .+  Sig_Omega[:, s-1]  ) ) ) 
