@@ -1,4 +1,4 @@
-using LinearAlgebra, Distributions , Random, Base.Threads, StatsBase, RCall, BlockDiagonals
+using LinearAlgebra, Distributions , Random,  StatsBase, RCall, BlockDiagonals
 
 function sim_flfosr(N, Mi, L, Tn, K)
     println("Simulating data using R's FLFOSR library...")
@@ -93,7 +93,7 @@ Y[:,l] corresponds to the j-th visit of the i-th subject, then X[l,:] has its co
 
 =#
 
-function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64},  K::Int64 = 10, S::Int64=2000 , informed_first_guess = true, S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1  )
+function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64},  K::Int64 = 10, S::Int64=2000 , informed_first_guess = true, S_burn::Int64 = 1000 , a_alph::Float64 = 0.1, b_alph::Float64 = 0.1, a_gamm::Float64 = 0.1, b_gamm::Float64 = 0.1, a_omeg::Float64 = 0.1,  b_omeg::Float64 = 0.1 , seed::Union{Int64,  Nothing} = nothing )
     #Makes sure that appropiate inputs are recieved. 
     T,M_Y = size(Y)
     M_X, L_p_one = size(X)
@@ -113,6 +113,11 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     #end
  
 
+    if seed !== nothing
+        Random.seed!(seed)
+        R"set.seed($seed)"
+    end
+    
     if mis_vals > 0 #If there are any missing values. 
         println("A total of $mis_vals missing values found!!\nFLFOSR will procede with intermediate imputations.\nBe aware that this increases computational cost and confidence bands!\nMight be worth to explore missingness")
         Y_user = copy(Y) #Copies the Y matrix provided by the user. 
@@ -131,6 +136,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
 
     id = 1:N |> collect
     idx = inverse_rle( id, M_rep )
+
 
     if K<= 40 
 
@@ -261,7 +267,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             ##----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         end 
     end
-    Threads.@threads for s in 1:(S - S_burn)  
+    for s in 1:(S - S_burn)  
         Alphaf[: ,:, s] .= B*Alpha[: ,:, s+S_burn-1]        
     end
 
