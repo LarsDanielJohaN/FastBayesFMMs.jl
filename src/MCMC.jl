@@ -180,6 +180,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
     Sig_Omega = zeros(N, S+1) #Creates a N x S matrix to store the realizations of the visit effect coefficient variances. 
     Sig_Omega[:, 1] = 0.5 .* ones(N)
     Y_hat = zeros(S+1, Tn, M_Y)
+    Residuals = zeros(S+1, Tn, M_Y)
 
 
 
@@ -256,8 +257,9 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
             Note that Y - B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s] constitutes the residuals of estimiating Y with the current values for the coefficients. 
             therefore, taking the norm of the previous consitutues the sum squared residuals. 
             =#
-            Y_hat[s, :, : ] .= B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates.         
-            Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2 , (2/ sum(((Y - Y_hat[s, :, : ]).^2 ) ) )      ), 1)[1] #Obtain new realization for the observation error variance. 
+            Y_hat[s, :, : ] .= B*( Alpha[:, :, s]*X' + Omega[:, :, s] + Gamma[:,idx, s]) #Stores current Y_hat estimates.   
+            Residuals[s, :, :] = Y - Y_hat[s, :, : ]   #Calculates residuals for current iteration.  
+            Sig_Eps[s] = 1/rand(Distributions.Gamma(Tn*M_Y/2 , (2/ sum(((Residuals[s,:,:]).^2 ) ) )      ), 1)[1] #Obtain new realization for the observation error variance. 
             Sig_Alpha[:, s] .= 1.0 ./ (rand.( Distributions.Gamma.( a_alph + K/2,     (1 ./ vec( b_alph .+ sum(Alpha[:, 1:(L+1), s].^2, dims=1)/2  ))      )) )
             Sig_Gamma[s] =  1/rand(Distributions.Gamma(a_gamm + N*K/2,     1/(b_gamm + sum(  (Gamma[:, :, s].^2) ./ 2 ))   ),     1)[1]   #Obtain new relizations for the subject effect coefficient variance/smoothing parameter.
             Sig_Omega[:, s] .= 1.0 ./ rand.(Distributions.Gamma.(alp_sig_omega, 1 ./ [  b_omeg + sum(  (Omega[ : , low_idx_M_rep[n]:upp_idx_M_rep[n] , s].^2) ./ 2 )  for n in 1:N]  )      )   
@@ -271,7 +273,7 @@ function flfosr(; Y::Matrix{Float64}, X::Matrix{Float64}, M_rep::Vector{Int64}, 
         Alphaf[: ,:, s] .= B*Alpha[: ,:, s+S_burn-1]        
     end
 
-    return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end], "Y_hat" =>Y_hat[S_burn:end, :, :] )
+    return Dict("X"=>X, "B"=>B_proj',  "w_post"=>Omega[:, :, S_burn:end], "ga_post"=>Gamma[:, :, S_burn:end], "alpha_post"=>Alpha[:, :, S_burn:end], "alpha_postf"=>Alphaf, "sig_eps_post"=>Sig_Eps[S_burn:end], "sig_alpha_post"=>Sig_Alpha[:, S_burn:end], "sig_gamma_post"=>Sig_Gamma[S_burn:end], "sig_omega_post"=>Sig_Omega[:, S_burn:end], "Y_hat" =>Y_hat[S_burn:end, :, :], "Y_residuals"=> Residuals[S_burn:end, :, :] )
 
 end 
 
